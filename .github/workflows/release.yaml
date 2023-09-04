@@ -343,9 +343,10 @@ jobs:
           tag_name: canary-golem
 
       - name: Recreate canary tag and release
-        uses: ncipollo/release-action@v1.10.0
+        uses: ncipollo/release-action@v1.13.0
         with:
           tag: canary-golem
           allowUpdates: true
           prerelease: true
+          token: ${{ secrets.TOKEN }}
           artifacts: "checksums-canary.txt,componentize-py-canary*,componentize_py-*.whl,componentize_py-*.tar.gz"
