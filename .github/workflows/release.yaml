@@ -263,7 +263,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: svenstaro/upload-release-action@v2
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          repo_token: ${{ secrets.TOKEN }}
           file: _dist/componentize-py-${{ env.RELEASE_VERSION }}-${{ env.RUNNER_OS }}-${{ matrix.config.arch }}.tar.gz
           tag: ${{ github.ref }}
 
@@ -300,7 +300,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: svenstaro/upload-release-action@v2
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          repo_token: ${{ secrets.TOKEN }}
           file: checksums-${{ env.RELEASE_VERSION }}.txt
           tag: ${{ github.ref }}
 
@@ -338,7 +338,7 @@ jobs:
       - name: Delete canary tag
         uses: dev-drprasad/delete-tag-and-release@v0.2.1
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.TOKEN }}
         with:
           tag_name: canary-golem
 
