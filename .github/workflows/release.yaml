@@ -180,7 +180,7 @@ jobs:
       - name: Set the release version (canary)
         if: github.ref == 'refs/heads/main'
         shell: bash
-        run: echo "RELEASE_VERSION=canary" >> $GITHUB_ENV
+        run: echo "RELEASE_VERSION=canary-golem" >> $GITHUB_ENV
 
       - name: Lowercase the runner OS name
         shell: bash
@@ -280,7 +280,7 @@ jobs:
       - name: Set the release version (canary)
         if: github.ref == 'refs/heads/main'
         shell: bash
-        run: echo "RELEASE_VERSION=canary" >> $GITHUB_ENV
+        run: echo "RELEASE_VERSION=canary-golem" >> $GITHUB_ENV
 
       - name: Download release assets
         uses: actions/download-artifact@v3
@@ -340,12 +340,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: canary
+          tag_name: canary-golem
 
       - name: Recreate canary tag and release
         uses: ncipollo/release-action@v1.10.0
         with:
-          tag: canary
+          tag: canary-golem
           allowUpdates: true
           prerelease: true
           artifacts: "checksums-canary.txt,componentize-py-canary*,componentize_py-*.whl,componentize_py-*.tar.gz"
