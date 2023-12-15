@@ -26,11 +26,11 @@ use {
         preview2::{
             command as wasi_command,
             pipe::{MemoryInputPipe, MemoryOutputPipe},
-            DirPerms, FilePerms, IsATTY, Table, WasiCtx, WasiCtxBuilder, WasiView,
+            DirPerms, FilePerms, Table, WasiCtx, WasiCtxBuilder, WasiView,
         },
         Dir,
     },
-    wit_parser::{Resolve, UnresolvedPackage, WorldId, WorldItem, WorldKey},
+    wit_parser::{Resolve, TypeDefKind, UnresolvedPackage, WorldId, WorldItem, WorldKey},
     zstd::Decoder,
 };
 
@@ -136,12 +136,17 @@ impl Invoker for MyInvoker {
     }
 }
 
-pub fn generate_bindings(wit_path: &Path, world: Option<&str>, output_dir: &Path) -> Result<()> {
+pub fn generate_bindings(
+    wit_path: &Path,
+    world: Option<&str>,
+    output_dir: &Path,
+    with_typings: bool,
+) -> Result<()> {
     let (resolve, world) = parse_wit(wit_path, world)?;
     let summary = Summary::try_new(&resolve, world)?;
     let world_dir = output_dir.join(resolve.worlds[world].name.to_snake_case().escape());
     fs::create_dir_all(&world_dir)?;
-    summary.generate_code(&world_dir)?;
+    summary.generate_code(&world_dir, with_typings)?;
 
     // Also generate `componentize_py_runtime` stub for type checking purposes:
     let internal_dir = output_dir.join("componentize_py_runtime");
@@ -175,6 +180,14 @@ pub async fn componentize(
         "/python-lib.tar.zst"
     ))))?)
     .unpack(stdlib.path())?;
+
+    let bundled = tempfile::tempdir()?;
+
+    Archive::new(Decoder::new(Cursor::new(include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/bundled.tar.zst"
+    ))))?)
+    .unpack(bundled.path())?;
 
     let (resolve, world) = parse_wit(wit_path, world)?;
     let summary = Summary::try_new(&resolve, world)?;
@@ -263,7 +276,7 @@ pub async fn componentize(
             "wasi_snapshot_preview1",
             &zstd::decode_all(Cursor::new(include_bytes!(concat!(
                 env!("OUT_DIR"),
-                "/wasi_snapshot_preview1.wasm.zst"
+                "/wasi_snapshot_preview1.reactor.wasm.zst"
             ))))?,
         )?;
 
@@ -289,7 +302,7 @@ pub async fn componentize(
         .path()
         .join(resolve.worlds[world].name.to_snake_case());
     fs::create_dir_all(&world_dir)?;
-    summary.generate_code(&world_dir)?;
+    summary.generate_code(&world_dir, false)?;
 
     let python_path = iter::once(
         generated_code
@@ -300,13 +313,13 @@ pub async fn componentize(
     .chain(python_path.iter().copied())
     .collect::<Vec<_>>();
 
-    let stdout = MemoryOutputPipe::new();
-    let stderr = MemoryOutputPipe::new();
+    let stdout = MemoryOutputPipe::new(10000);
+    let stderr = MemoryOutputPipe::new(10000);
 
     let mut wasi = WasiCtxBuilder::new();
-    wasi.stdin(MemoryInputPipe::new(Bytes::new()), IsATTY::No)
-        .stdout(stdout.clone(), IsATTY::No)
-        .stderr(stderr.clone(), IsATTY::No)
+    wasi.stdin(MemoryInputPipe::new(Bytes::new()))
+        .stdout(stdout.clone())
+        .stderr(stderr.clone())
         .env("PYTHONUNBUFFERED", "1")
         .env("COMPONENTIZE_PY_APP_NAME", app_name)
         .env("PYTHONHOME", "/python")
@@ -316,6 +329,13 @@ pub async fn componentize(
             DirPerms::all(),
             FilePerms::all(),
             "python",
+        )
+        .preopened_dir(
+            Dir::open_ambient_dir(bundled.path(), cap_std::ambient_authority())
+                .with_context(|| format!("unable to open {}", bundled.path().display()))?,
+            DirPerms::all(),
+            FilePerms::all(),
+            "bundled",
         );
 
     for (index, path) in python_path.iter().enumerate() {
@@ -333,10 +353,10 @@ pub async fn componentize(
         .collect::<Vec<_>>()
         .join(":");
 
-    let mut table = Table::new();
+    let table = Table::new();
     let wasi = wasi
-        .env("PYTHONPATH", format!("/python:{python_path}"))
-        .build(&mut table)?;
+        .env("PYTHONPATH", format!("/python:/bundled:{python_path}"))
+        .build();
 
     let mut config = Config::new();
     config.wasm_component_model(true);
@@ -407,63 +427,89 @@ fn add_wasi_and_stubs(
 ) -> Result<()> {
     wasi_command::add_to_linker(linker)?;
 
-    let mut functions = HashMap::<_, Vec<_>>::new();
-    for (key, item) in &resolve.worlds[world].imports {
-        let interface_name = match key {
-            WorldKey::Name(name) => name.clone(),
-            WorldKey::Interface(interface) => {
-                let interface = &resolve.interfaces[*interface];
-                format!(
-                    "{}{}",
-                    if let Some(package) = interface.package {
-                        let package = &resolve.packages[package];
-                        format!("{}:{}/", package.name.namespace, package.name.name)
-                    } else {
-                        String::new()
-                    },
-                    interface.name.as_deref().unwrap()
-                )
-            }
-        };
+    enum Stub<'a> {
+        Function(&'a String),
+        Resource(&'a String),
+    }
 
+    let mut stubs = HashMap::<_, Vec<_>>::new();
+    for (key, item) in &resolve.worlds[world].imports {
         match item {
             WorldItem::Interface(interface) => {
+                let interface_name = match key {
+                    WorldKey::Name(name) => name.clone(),
+                    WorldKey::Interface(interface) => resolve.id_of(*interface).unwrap(),
+                };
+
                 let interface = &resolve.interfaces[*interface];
                 for function_name in interface.functions.keys() {
-                    functions
+                    stubs
                         .entry(Some(interface_name.clone()))
                         .or_default()
-                        .push(function_name);
+                        .push(Stub::Function(function_name));
+                }
+
+                for (type_name, id) in interface.types.iter() {
+                    if let TypeDefKind::Resource = &resolve.types[*id].kind {
+                        stubs
+                            .entry(Some(interface_name.clone()))
+                            .or_default()
+                            .push(Stub::Resource(type_name));
+                    }
                 }
             }
             WorldItem::Function(function) => {
-                functions.entry(None).or_default().push(&function.name);
+                stubs
+                    .entry(None)
+                    .or_default()
+                    .push(Stub::Function(&function.name));
             }
-            WorldItem::Type(_) => unreachable!(),
+            WorldItem::Type(id) => {
+                let ty = &resolve.types[*id];
+                if let TypeDefKind::Resource = &ty.kind {
+                    stubs
+                        .entry(None)
+                        .or_default()
+                        .push(Stub::Resource(ty.name.as_ref().unwrap()));
+                }
+            }
         }
     }
 
-    for (interface_name, functions) in functions {
+    for (interface_name, stubs) in stubs {
         if let Some(interface_name) = interface_name {
-            let mut instance = linker.instance(&interface_name)?;
-            for function_name in functions {
-                instance.func_new(component, function_name, {
+            if let Ok(mut instance) = linker.instance(&interface_name) {
+                for stub in stubs {
                     let interface_name = interface_name.clone();
-                    let function_name = function_name.clone();
-                    move |_, _, _| {
-                        Err(anyhow!(
-                            "called trapping stub: {interface_name}#{function_name}"
-                        ))
-                    }
-                })?;
+                    match stub {
+                        Stub::Function(name) => instance.func_new(component, name, {
+                            let name = name.clone();
+                            move |_, _, _| {
+                                Err(anyhow!("called trapping stub: {interface_name}#{name}"))
+                            }
+                        }),
+                        Stub::Resource(name) => instance.resource::<()>(name, {
+                            let name = name.clone();
+                            move |_, _| {
+                                Err(anyhow!("called trapping stub: {interface_name}#{name}"))
+                            }
+                        }),
+                    }?;
+                }
             }
         } else {
             let mut instance = linker.root();
-            for function_name in functions {
-                instance.func_new(component, function_name, {
-                    let function_name = function_name.clone();
-                    move |_, _, _| Err(anyhow!("called trapping stub: {function_name}"))
-                })?;
+            for stub in stubs {
+                match stub {
+                    Stub::Function(name) => instance.func_new(component, name, {
+                        let name = name.clone();
+                        move |_, _, _| Err(anyhow!("called trapping stub: {name}"))
+                    }),
+                    Stub::Resource(name) => instance.resource::<()>(name, {
+                        let name = name.clone();
+                        move |_, _| Err(anyhow!("called trapping stub: {name}"))
+                    }),
+                }?;
             }
         }
     }

@@ -61,7 +61,7 @@ fn stubs_for_clippy(out_dir: &Path) -> Result<()> {
         "libwasi-emulated-signal.so.zst",
         "libc++.so.zst",
         "libc++abi.so.zst",
-        "wasi_snapshot_preview1.wasm.zst",
+        "wasi_snapshot_preview1.reactor.wasm.zst",
     ];
 
     for file in files {
@@ -73,6 +73,14 @@ fn stubs_for_clippy(out_dir: &Path) -> Result<()> {
     }
 
     let path = out_dir.join("python-lib.tar.zst");
+
+    if !path.exists() {
+        Builder::new(Encoder::new(File::create(path)?, ZSTD_COMPRESSION_LEVEL)?)
+            .into_inner()?
+            .do_finish()?;
+    }
+
+    let path = out_dir.join("bundled.tar.zst");
 
     if !path.exists() {
         Builder::new(Encoder::new(File::create(path)?, ZSTD_COMPRESSION_LEVEL)?)
@@ -127,7 +135,7 @@ fn package_all_the_things(out_dir: &Path) -> Result<()> {
     let path = out_dir.join("wasm32-wasi/release/libcomponentize_py_runtime.a");
 
     if path.exists() {
-        let clang = wasi_sdk.join(&format!("bin/{CLANG_EXECUTABLE}"));
+        let clang = wasi_sdk.join(format!("bin/{CLANG_EXECUTABLE}"));
         if clang.exists() {
             let name = "libcomponentize_py_runtime.so";
 
@@ -185,20 +193,24 @@ fn package_all_the_things(out_dir: &Path) -> Result<()> {
         bail!("no such directory: {}", path.display())
     }
 
-    let mut cmd = Command::new("cargo");
-    cmd.arg("build")
-        .current_dir("wasmtime/crates/wasi-preview1-component-adapter")
-        .arg("--release")
-        .arg("--target=wasm32-unknown-unknown")
-        .env("CARGO_TARGET_DIR", out_dir);
+    let path = repo_dir.join("bundled");
 
-    let status = cmd.status()?;
-    assert!(status.success());
-    println!("cargo:rerun-if-changed=wasmtime");
+    if path.exists() {
+        let mut builder = Builder::new(Encoder::new(
+            File::create(out_dir.join("bundled.tar.zst"))?,
+            ZSTD_COMPRESSION_LEVEL,
+        )?);
+
+        add(&mut builder, &path, &path)?;
+
+        builder.into_inner()?.do_finish()?;
+    } else {
+        bail!("no such directory: {}", path.display())
+    }
 
     compress(
-        &out_dir.join("wasm32-unknown-unknown/release"),
-        "wasi_snapshot_preview1.wasm",
+        &repo_dir.join("adapters/6f0da84"),
+        "wasi_snapshot_preview1.reactor.wasm",
         out_dir,
         false,
     )?;

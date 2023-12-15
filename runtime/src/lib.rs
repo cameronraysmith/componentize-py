@@ -3,11 +3,15 @@
 use {
     anyhow::{Error, Result},
     componentize_py_shared::ReturnStyle,
-    exports::exports::{self as exp, Exports, OwnedKind, OwnedType, Symbols},
+    exports::exports::{
+        self as exp, Constructor, Function, FunctionExport, Guest, LocalResource, OwnedKind,
+        OwnedType, RemoteResource, Resource, Static, Symbols,
+    },
     num_bigint::BigUint,
     once_cell::sync::OnceCell,
     pyo3::{
         exceptions::PyAssertionError,
+        intern,
         types::{PyBytes, PyDict, PyList, PyMapping, PyModule, PyString, PyTuple},
         Py, PyAny, PyErr, PyObject, PyResult, Python, ToPyObject,
     },
@@ -16,21 +20,29 @@ use {
         ffi::c_void,
         mem::{self, MaybeUninit},
         ptr, slice, str,
+        sync::Once,
     },
     wasi::cli::environment,
 };
 
 wit_bindgen::generate!({
     world: "init",
-    path: "../wit"
+    path: "../wit",
+    exports: {
+        "exports": MyExports
+    }
 });
 
-static EXPORTS: OnceCell<Vec<(Py<PyString>, PyObject)>> = OnceCell::new();
+static EXPORTS: OnceCell<Vec<Export>> = OnceCell::new();
 static TYPES: OnceCell<Vec<Type>> = OnceCell::new();
 static ENVIRON: OnceCell<Py<PyMapping>> = OnceCell::new();
 static SOME_CONSTRUCTOR: OnceCell<PyObject> = OnceCell::new();
 static OK_CONSTRUCTOR: OnceCell<PyObject> = OnceCell::new();
 static ERR_CONSTRUCTOR: OnceCell<PyObject> = OnceCell::new();
+static FINALIZE: OnceCell<PyObject> = OnceCell::new();
+static DROP_RESOURCE: OnceCell<PyObject> = OnceCell::new();
+static SEED: OnceCell<PyObject> = OnceCell::new();
+static ARGV: OnceCell<Py<PyList>> = OnceCell::new();
 
 const DISCRIMINANT_FIELD_INDEX: i32 = 0;
 const PAYLOAD_FIELD_INDEX: i32 = 1;
@@ -63,6 +75,27 @@ enum Type {
     NestingOption,
     Result,
     Tuple(usize),
+    Handle,
+    Resource {
+        constructor: PyObject,
+        local: Option<LocalResource>,
+        #[allow(dead_code)]
+        remote: Option<RemoteResource>,
+    },
+}
+
+#[derive(Debug)]
+enum Export {
+    Freestanding {
+        instance: PyObject,
+        name: Py<PyString>,
+    },
+    Constructor(PyObject),
+    Method(Py<PyString>),
+    Static {
+        class: PyObject,
+        name: Py<PyString>,
+    },
 }
 
 struct Anyhow(Error);
@@ -114,10 +147,26 @@ fn call_import<'a>(
     }
 }
 
+#[pyo3::pyfunction]
+#[pyo3(pass_module)]
+fn drop_resource(module: &PyModule, index: u32, handle: usize) -> PyResult<()> {
+    let params = [handle];
+    unsafe {
+        componentize_py_call_indirect(
+            &module.py() as *const _ as _,
+            params.as_ptr() as _,
+            ptr::null_mut(),
+            index,
+        );
+    }
+    Ok(())
+}
+
 #[pyo3::pymodule]
 #[pyo3(name = "componentize_py_runtime")]
 fn componentize_py_module(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
-    module.add_function(pyo3::wrap_pyfunction!(call_import, module)?)
+    module.add_function(pyo3::wrap_pyfunction!(call_import, module)?)?;
+    module.add_function(pyo3::wrap_pyfunction!(drop_resource, module)?)
 }
 
 fn do_init(app_name: String, symbols: Symbols) -> Result<()> {
@@ -126,18 +175,49 @@ fn do_init(app_name: String, symbols: Symbols) -> Result<()> {
     pyo3::prepare_freethreaded_python();
 
     Python::with_gil(|py| {
-        let app = py.import(app_name.as_str())?;
+        let app = match py.import(app_name.as_str()) {
+            Ok(app) => app,
+            Err(e) => {
+                e.print(py);
+                return Err(e.into());
+            }
+        };
 
         EXPORTS
             .set(
                 symbols
                     .exports
                     .iter()
-                    .map(|function| {
-                        Ok((
-                            PyString::intern(py, &function.name).into(),
-                            app.getattr(function.protocol.as_str())?.call0()?.into(),
-                        ))
+                    .map(|export| {
+                        Ok(match export {
+                            FunctionExport::Freestanding(Function { protocol, name }) => {
+                                Export::Freestanding {
+                                    name: PyString::intern(py, name).into(),
+                                    instance: app.getattr(protocol.as_str())?.call0()?.into(),
+                                }
+                            }
+                            FunctionExport::Constructor(Constructor { module, protocol }) => {
+                                Export::Constructor(
+                                    py.import(module.as_str())?
+                                        .getattr(protocol.as_str())?
+                                        .into(),
+                                )
+                            }
+                            FunctionExport::Method(name) => {
+                                Export::Method(PyString::intern(py, name).into())
+                            }
+                            FunctionExport::Static(Static {
+                                module,
+                                protocol,
+                                name,
+                            }) => Export::Static {
+                                name: PyString::intern(py, name).into(),
+                                class: py
+                                    .import(module.as_str())?
+                                    .getattr(protocol.as_str())?
+                                    .into(),
+                            },
+                        })
                     })
                     .collect::<PyResult<_>>()?,
             )
@@ -202,11 +282,20 @@ fn do_init(app_name: String, symbols: Symbols) -> Result<()> {
                                         .into(),
                                     u32_count: u32_count.try_into().unwrap(),
                                 },
+                                OwnedKind::Resource(Resource { local, remote }) => Type::Resource {
+                                    constructor: py
+                                        .import(package.as_str())?
+                                        .getattr(name.as_str())?
+                                        .into(),
+                                    local,
+                                    remote,
+                                },
                             },
                             exp::Type::Option => Type::Option,
                             exp::Type::NestingOption => Type::NestingOption,
                             exp::Type::Result => Type::Result,
                             exp::Type::Tuple(length) => Type::Tuple(length.try_into().unwrap()),
+                            exp::Type::Handle => Type::Handle,
                         })
                     })
                     .collect::<PyResult<_>>()?,
@@ -233,19 +322,59 @@ fn do_init(app_name: String, symbols: Symbols) -> Result<()> {
 
         ENVIRON.set(environ.into()).unwrap();
 
+        FINALIZE
+            .set(py.import("weakref")?.getattr("finalize")?.into())
+            .unwrap();
+
+        DROP_RESOURCE
+            .set(
+                py.import("componentize_py_runtime")?
+                    .getattr("drop_resource")?
+                    .into(),
+            )
+            .unwrap();
+
+        SEED.set(py.import("random")?.getattr("seed")?.into())
+            .unwrap();
+
+        let argv = py
+            .import("sys")?
+            .getattr("argv")?
+            .downcast::<PyList>()
+            .unwrap();
+
+        for i in 0..argv.len() {
+            argv.del_item(i)?;
+        }
+
+        ARGV.set(argv.into()).unwrap();
+
         Ok(())
     })
 }
 
 struct MyExports;
 
-impl Exports for MyExports {
+impl Guest for MyExports {
     fn init(app_name: String, symbols: Symbols) -> Result<(), String> {
-        do_init(app_name, symbols).map_err(|e| format!("{e:?}"))
+        let result = do_init(app_name, symbols).map_err(|e| format!("{e:?}"));
+
+        // This tells the WASI Preview 1 component adapter to reset its state.  In particular, we want it to forget
+        // about any open handles and re-request the stdio handles at runtime since we'll be running under a brand
+        // new host.
+        #[link(wasm_import_module = "wasi_snapshot_preview1")]
+        extern "C" {
+            #[cfg_attr(target_arch = "wasm32", link_name = "reset_adapter_state")]
+            fn reset_adapter_state();
+        }
+
+        unsafe {
+            reset_adapter_state();
+        }
+
+        result
     }
 }
-
-export_init!(MyExports);
 
 /// # Safety
 /// TODO
@@ -273,15 +402,38 @@ pub unsafe extern "C" fn componentize_py_dispatch(
         // todo: is this sound, or do we need to `.into_iter().map(MaybeUninit::assume_init).collect()` instead?
         let params_lifted = mem::transmute::<Vec<MaybeUninit<&PyAny>>, Vec<&PyAny>>(params_lifted);
 
-        // We must call directly into the host to get the runtime environment since libc's version will only
-        // contain the build-time pre-init snapshot.
-        let environ = ENVIRON.get().unwrap().as_ref(py);
-        for (k, v) in environment::get_environment() {
-            environ.set_item(k, v).unwrap();
-        }
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            // We must call directly into the host to get the runtime environment since libc's version will only
+            // contain the build-time pre-init snapshot.
+            let environ = ENVIRON.get().unwrap().as_ref(py);
+            for (k, v) in environment::get_environment() {
+                environ.set_item(k, v).unwrap();
+            }
 
-        let (name, target) = &EXPORTS.get().unwrap()[export];
-        let result = target.call_method1(py, name.as_ref(py), PyTuple::new(py, params_lifted));
+            // Likewise for CLI arguments.
+            for arg in environment::get_arguments() {
+                ARGV.get().unwrap().as_ref(py).append(arg).unwrap();
+            }
+
+            // Call `random.seed()` to ensure we get a fresh seed rather than the one that got baked in during
+            // pre-init.
+            SEED.get().unwrap().call0(py).unwrap();
+        });
+
+        let export = &EXPORTS.get().unwrap()[export];
+        let result = match export {
+            Export::Freestanding { instance, name } => {
+                instance.call_method1(py, name.as_ref(py), PyTuple::new(py, params_lifted))
+            }
+            Export::Constructor(class) => class.call1(py, PyTuple::new(py, params_lifted)),
+            Export::Method(name) => params_lifted[0]
+                .call_method1(name.as_ref(py), PyTuple::new(py, &params_lifted[1..]))
+                .map(|r| r.into()),
+            Export::Static { class, name } => class
+                .getattr(py, name.as_ref(py))
+                .and_then(|function| function.call1(py, PyTuple::new(py, params_lifted))),
+        };
 
         let result = match return_style {
             ReturnStyle::Normal => match result {
@@ -395,6 +547,7 @@ pub extern "C" fn componentize_py_get_field<'a>(
             let discriminant = types_to_discriminants
                 .as_ref(*py)
                 .get_item(value.get_type())
+                .unwrap()
                 .unwrap();
 
             match i32::try_from(field).unwrap() {
@@ -488,6 +641,7 @@ pub extern "C" fn componentize_py_get_field<'a>(
                 .get_item(field)
                 .unwrap()
         }
+        Type::Handle | Type::Resource { .. } => unreachable!(),
     }
 }
 
@@ -687,6 +841,7 @@ pub unsafe extern "C" fn componentize_py_init<'a>(
             assert!(*length == len);
             PyTuple::new(*py, slice::from_raw_parts(data, len))
         }
+        Type::Handle | Type::Resource { .. } => unreachable!(),
     }
 }
 
@@ -731,6 +886,179 @@ pub unsafe extern "C" fn componentize_py_make_bytes<'a>(
         Ok(())
     })
     .unwrap()
+}
+
+#[export_name = "componentize-py#LiftHandle"]
+pub extern "C" fn componentize_py_lift_handle<'a>(
+    py: &'a Python<'a>,
+    value: i32,
+    borrow: i32,
+    local: i32,
+    resource: i32,
+) -> &'a PyAny {
+    let ty = &TYPES.get().unwrap()[usize::try_from(resource).unwrap()];
+    let Type::Resource {
+        constructor,
+        local: resource_local,
+        remote: resource_remote,
+    } = ty
+    else {
+        panic!("expected resource, found {ty:?}");
+    };
+
+    if local != 0 {
+        if borrow != 0 {
+            unsafe { PyObject::from_borrowed_ptr(*py, value as usize as _) }.into_ref(*py)
+        } else {
+            let Some(LocalResource { rep, .. }) = resource_local else {
+                panic!("expected local resource, found {ty:?}");
+            };
+
+            let rep = {
+                let params = [value];
+                let mut results = [MaybeUninit::<usize>::uninit()];
+                unsafe {
+                    componentize_py_call_indirect(
+                        py as *const _ as _,
+                        params.as_ptr() as _,
+                        results.as_mut_ptr() as _,
+                        *rep,
+                    );
+                    results[0].assume_init()
+                }
+            };
+
+            let value = unsafe { PyObject::from_borrowed_ptr(*py, rep as _) }.into_ref(*py);
+
+            value
+                .delattr(intern!(*py, "__componentize_py_handle"))
+                .unwrap();
+
+            value
+                .getattr(intern!(*py, "finalizer"))
+                .unwrap()
+                .call_method0(intern!(*py, "detach"))
+                .unwrap();
+
+            value
+        }
+    } else {
+        let Some(RemoteResource { drop }) = resource_remote else {
+            panic!("expected remote resource, found {ty:?}");
+        };
+
+        let instance = constructor
+            .call_method1(
+                *py,
+                intern!(*py, "__new__"),
+                PyTuple::new(*py, [constructor]),
+            )
+            .unwrap();
+
+        let handle = value.to_object(*py);
+
+        instance
+            .setattr(*py, intern!(*py, "handle"), handle.clone())
+            .unwrap();
+
+        let finalizer = FINALIZE
+            .get()
+            .unwrap()
+            .call1(
+                *py,
+                (
+                    instance.clone(),
+                    DROP_RESOURCE.get().unwrap(),
+                    drop.to_object(*py),
+                    handle,
+                ),
+            )
+            .unwrap();
+
+        instance
+            .setattr(*py, intern!(*py, "finalizer"), finalizer)
+            .unwrap();
+
+        instance.into_ref(*py)
+    }
+}
+
+#[export_name = "componentize-py#LowerHandle"]
+pub extern "C" fn componentize_py_lower_handle(
+    py: &Python,
+    value: &PyAny,
+    borrow: i32,
+    local: i32,
+    resource: i32,
+) -> u32 {
+    if local != 0 {
+        let ty = &TYPES.get().unwrap()[usize::try_from(resource).unwrap()];
+        let Type::Resource {
+            local: Some(LocalResource { new, drop, .. }),
+            ..
+        } = ty
+        else {
+            panic!("expected local resource, found {ty:?}");
+        };
+
+        let name = intern!(*py, "__componentize_py_handle");
+        if value.hasattr(name).unwrap() {
+            value.getattr(name).unwrap().extract().unwrap()
+        } else {
+            let rep = PyObject::from(value).into_ptr();
+            let handle = {
+                let params = [rep as usize];
+                let mut results = [MaybeUninit::<u32>::uninit()];
+                unsafe {
+                    componentize_py_call_indirect(
+                        py as *const _ as _,
+                        params.as_ptr() as _,
+                        results.as_mut_ptr() as _,
+                        *new,
+                    );
+                    results[0].assume_init()
+                }
+            };
+
+            let instance = unsafe { PyObject::from_borrowed_ptr(*py, rep) };
+
+            instance.setattr(*py, name, handle.to_object(*py)).unwrap();
+
+            let finalizer = FINALIZE
+                .get()
+                .unwrap()
+                .call1(
+                    *py,
+                    (
+                        instance.clone(),
+                        DROP_RESOURCE.get().unwrap(),
+                        drop.to_object(*py),
+                        handle,
+                    ),
+                )
+                .unwrap();
+
+            instance
+                .setattr(*py, intern!(*py, "finalizer"), finalizer)
+                .unwrap();
+
+            handle
+        }
+    } else {
+        if borrow == 0 {
+            value
+                .getattr(intern!(*py, "finalizer"))
+                .unwrap()
+                .call_method0(intern!(*py, "detach"))
+                .unwrap();
+        }
+
+        value
+            .getattr(intern!(*py, "handle"))
+            .unwrap()
+            .extract()
+            .unwrap()
+    }
 }
 
 /// # Safety
