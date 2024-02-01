@@ -8,7 +8,7 @@ use {
 #[pyo3(name = "componentize")]
 #[pyo3(signature = (wit_path, world, python_path, app_name, output_path))]
 fn python_componentize(
-    wit_path: PathBuf,
+    wit_path: Option<PathBuf>,
     world: Option<&str>,
     python_path: Vec<&str>,
     app_name: &str,
@@ -16,7 +16,7 @@ fn python_componentize(
 ) -> PyResult<()> {
     (|| {
         Runtime::new()?.block_on(crate::componentize(
-            &wit_path,
+            wit_path.as_deref(),
             world,
             &python_path,
             app_name,
@@ -29,14 +29,14 @@ fn python_componentize(
 
 #[pyo3::pyfunction]
 #[pyo3(name = "generate_bindings")]
-#[pyo3(signature = (wit_path, world, output_dir, with_typings))]
+#[pyo3(signature = (wit_path, world, world_module, output_dir))]
 fn python_generate_bindings(
     wit_path: PathBuf,
     world: Option<&str>,
+    world_module: Option<&str>,
     output_dir: PathBuf,
-    with_typings: bool,
 ) -> PyResult<()> {
-    crate::generate_bindings(&wit_path, world, &output_dir, with_typings)
+    crate::generate_bindings(&wit_path, world, world_module, &output_dir)
         .map_err(|e| PyAssertionError::new_err(format!("{e:?}")))
 }
 

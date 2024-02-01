@@ -1,32 +1,32 @@
 #![deny(warnings)]
 
 use {
-    anyhow::{anyhow, Context, Result},
+    anyhow::{anyhow, bail, ensure, Context, Error, Result},
     async_trait::async_trait,
     bytes::Bytes,
     component_init::Invoker,
     futures::future::FutureExt,
     heck::ToSnakeCase,
+    serde::Deserialize,
     std::{
         collections::HashMap,
-        env,
-        fs::{self, File},
-        io::{Cursor, Write},
-        iter,
+        env, fs,
+        io::Cursor,
+        ops::Deref,
         path::{Path, PathBuf},
         str,
     },
     summary::{Escape, Summary},
     tar::Archive,
     wasmtime::{
-        component::{Component, Instance, Linker},
+        component::{Component, Instance, Linker, ResourceTable, ResourceType},
         Config, Engine, Store,
     },
     wasmtime_wasi::{
         preview2::{
             command as wasi_command,
             pipe::{MemoryInputPipe, MemoryOutputPipe},
-            DirPerms, FilePerms, Table, WasiCtx, WasiCtxBuilder, WasiView,
+            DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiView,
         },
         Dir,
     },
@@ -45,7 +45,7 @@ mod summary;
 mod test;
 mod util;
 
-static NATIVE_EXTENSION_SUFFIX: &str = ".cpython-311-wasm32-wasi.so";
+static NATIVE_EXTENSION_SUFFIX: &str = ".cpython-312-wasm32-wasi.so";
 
 wasmtime::component::bindgen!({
     path: "wit",
@@ -55,7 +55,7 @@ wasmtime::component::bindgen!({
 
 pub struct Ctx {
     wasi: WasiCtx,
-    table: Table,
+    table: ResourceTable,
 }
 
 impl WasiView for Ctx {
@@ -65,11 +65,42 @@ impl WasiView for Ctx {
     fn ctx_mut(&mut self) -> &mut WasiCtx {
         &mut self.wasi
     }
-    fn table(&self) -> &Table {
+    fn table(&self) -> &ResourceTable {
         &self.table
     }
-    fn table_mut(&mut self) -> &mut Table {
+    fn table_mut(&mut self) -> &mut ResourceTable {
         &mut self.table
+    }
+}
+
+#[derive(Deserialize)]
+struct RawComponentizePyConfig {
+    bindings: Option<String>,
+    wit_directory: Option<String>,
+}
+
+struct ComponentizePyConfig {
+    bindings: Option<PathBuf>,
+    wit_directory: Option<PathBuf>,
+}
+
+impl TryFrom<(&Path, RawComponentizePyConfig)> for ComponentizePyConfig {
+    type Error = Error;
+
+    fn try_from((path, raw): (&Path, RawComponentizePyConfig)) -> Result<Self> {
+        let base = path.canonicalize()?;
+        let convert = |p| {
+            // Ensure this is a relative path under `base`:
+            let p = base.join(p);
+            let p = p.canonicalize().with_context(|| p.display().to_string())?;
+            ensure!(p.starts_with(&base));
+            Ok(p)
+        };
+
+        Ok(Self {
+            bindings: raw.bindings.map(convert).transpose()?,
+            wit_directory: raw.wit_directory.map(convert).transpose()?,
+        })
     }
 }
 
@@ -139,34 +170,23 @@ impl Invoker for MyInvoker {
 pub fn generate_bindings(
     wit_path: &Path,
     world: Option<&str>,
+    world_module: Option<&str>,
     output_dir: &Path,
-    with_typings: bool,
 ) -> Result<()> {
     let (resolve, world) = parse_wit(wit_path, world)?;
     let summary = Summary::try_new(&resolve, world)?;
-    let world_dir = output_dir.join(resolve.worlds[world].name.to_snake_case().escape());
+    let world_name = resolve.worlds[world].name.to_snake_case().escape();
+    let world_module = world_module.unwrap_or(&world_name);
+    let world_dir = output_dir.join(world_module.replace('.', "/"));
     fs::create_dir_all(&world_dir)?;
-    summary.generate_code(&world_dir, with_typings)?;
-
-    // Also generate `componentize_py_runtime` stub for type checking purposes:
-    let internal_dir = output_dir.join("componentize_py_runtime");
-    fs::create_dir_all(&internal_dir)?;
-    let mut file = File::create(internal_dir.join("__init__.py"))?;
-    file.write_all(
-        b"
-from typing import List, Any
-
-def call_import(index: int, args: List[Any], result_count: int) -> List[Any]:
-    raise NotImplementedError
-",
-    )?;
+    summary.generate_code(&world_dir, world_module, true)?;
 
     Ok(())
 }
 
 #[allow(clippy::type_complexity)]
 pub async fn componentize(
-    wit_path: &Path,
+    wit_path: Option<&Path>,
     world: Option<&str>,
     python_path: &[&str],
     app_name: &str,
@@ -189,9 +209,39 @@ pub async fn componentize(
     ))))?)
     .unpack(bundled.path())?;
 
-    let (resolve, world) = parse_wit(wit_path, world)?;
+    let mut raw_config = None;
+    let mut library_path = Vec::with_capacity(python_path.len());
+    for path in python_path {
+        let mut libraries = Vec::new();
+        search_directory(
+            Path::new(path),
+            Path::new(path),
+            &mut libraries,
+            &mut raw_config,
+        )?;
+        library_path.push((*path, libraries));
+    }
+
+    let config = if let Some((config_root, config_path, raw)) = raw_config {
+        let config = ComponentizePyConfig::try_from((config_path.deref(), raw))?;
+        Some((config_root, config_path, config))
+    } else {
+        None
+    };
+
+    let wit_path = if let Some(path) = wit_path {
+        path.to_owned()
+    } else if let Some((config_path, wit_path)) = config
+        .as_ref()
+        .and_then(|(_, p, c)| c.wit_directory.as_deref().map(|f| (p, f)))
+    {
+        config_path.join(wit_path)
+    } else {
+        Path::new("wit").to_owned()
+    };
+
+    let (resolve, world) = parse_wit(&wit_path, world)?;
     let summary = Summary::try_new(&resolve, world)?;
-    let symbols = summary.collect_symbols();
 
     let mut linker = wit_component::Linker::default()
         .validate(true)
@@ -204,10 +254,10 @@ pub async fn componentize(
             false,
         )?
         .library(
-            "libpython3.11.so",
+            "libpython3.12.so",
             &zstd::decode_all(Cursor::new(include_bytes!(concat!(
                 env!("OUT_DIR"),
-                "/libpython3.11.so.zst"
+                "/libpython3.12.so.zst"
             ))))?,
             false,
         )?
@@ -280,10 +330,7 @@ pub async fn componentize(
             ))))?,
         )?;
 
-    for (index, path) in python_path.iter().enumerate() {
-        let index = index + 1;
-        let mut libraries = Vec::new();
-        find_native_extensions(Path::new(path), &mut libraries)?;
+    for (index, (path, libraries)) in library_path.iter().enumerate() {
         for library in libraries {
             let path = library
                 .strip_prefix(path)
@@ -291,27 +338,11 @@ pub async fn componentize(
                 .to_str()
                 .context("non-UTF-8 path")?;
 
-            linker = linker.library(&format!("/{index}/{path}"), &fs::read(&library)?, true)?
+            linker = linker.library(&format!("/{index}/{path}"), &fs::read(library)?, true)?;
         }
     }
 
     let component = linker.encode()?;
-
-    let generated_code = tempfile::tempdir()?;
-    let world_dir = generated_code
-        .path()
-        .join(resolve.worlds[world].name.to_snake_case());
-    fs::create_dir_all(&world_dir)?;
-    summary.generate_code(&world_dir, false)?;
-
-    let python_path = iter::once(
-        generated_code
-            .path()
-            .to_str()
-            .context("non-UTF-8 temporary directory name")?,
-    )
-    .chain(python_path.iter().copied())
-    .collect::<Vec<_>>();
 
     let stdout = MemoryOutputPipe::new(10000);
     let stderr = MemoryOutputPipe::new(10000);
@@ -348,14 +379,76 @@ pub async fn componentize(
         );
     }
 
+    let world_dir = tempfile::tempdir()?;
+
+    let (world_dir_mounts, world_module) = if let Some((config_root, config_path, binding_path)) =
+        config
+            .as_ref()
+            .and_then(|(r, p, c)| c.bindings.as_deref().map(|f| (r, p, f)))
+    {
+        let paths = python_path
+            .iter()
+            .enumerate()
+            .map(|(index, dir)| {
+                let dir = Path::new(dir).canonicalize()?;
+                let config_root = config_root.canonicalize()?;
+                Ok(if config_root == dir {
+                    config_path
+                        .canonicalize()?
+                        .join(binding_path)
+                        .strip_prefix(dir)
+                        .ok()
+                        .map(|p| (index, p.to_str().unwrap().to_owned()))
+                } else {
+                    None
+                })
+            })
+            .filter_map(Result::transpose)
+            .collect::<Result<Vec<_>>>()?;
+
+        let module = paths.first().unwrap().1.replace('/', ".");
+
+        summary.generate_code(world_dir.path(), &module, false)?;
+
+        (
+            paths
+                .iter()
+                .map(|(index, p)| format!("{index}/{p}"))
+                .collect::<Vec<_>>(),
+            module,
+        )
+    } else {
+        let module = resolve.worlds[world].name.to_snake_case();
+        let world_dir = world_dir.path().join(&module);
+        fs::create_dir_all(&world_dir)?;
+        summary.generate_code(&world_dir, &module, false)?;
+
+        (vec!["world".to_owned()], module)
+    };
+
+    for mount in world_dir_mounts {
+        wasi.preopened_dir(
+            Dir::open_ambient_dir(world_dir.path(), cap_std::ambient_authority())
+                .with_context(|| format!("unable to open {}", world_dir.path().display()))?,
+            DirPerms::all(),
+            FilePerms::all(),
+            &mount,
+        );
+    }
+
+    let symbols = summary.collect_symbols(&world_module);
+
     let python_path = (0..python_path.len())
         .map(|index| format!("/{index}"))
         .collect::<Vec<_>>()
         .join(":");
 
-    let table = Table::new();
+    let table = ResourceTable::new();
     let wasi = wasi
-        .env("PYTHONPATH", format!("/python:/bundled:{python_path}"))
+        .env(
+            "PYTHONPATH",
+            format!("/python:/bundled:/world:{python_path}"),
+        )
         .build();
 
     let mut config = Config::new();
@@ -488,12 +581,14 @@ fn add_wasi_and_stubs(
                                 Err(anyhow!("called trapping stub: {interface_name}#{name}"))
                             }
                         }),
-                        Stub::Resource(name) => instance.resource::<()>(name, {
-                            let name = name.clone();
-                            move |_, _| {
-                                Err(anyhow!("called trapping stub: {interface_name}#{name}"))
-                            }
-                        }),
+                        Stub::Resource(name) => instance
+                            .resource(name, ResourceType::host::<()>(), {
+                                let name = name.clone();
+                                move |_, _| {
+                                    Err(anyhow!("called trapping stub: {interface_name}#{name}"))
+                                }
+                            })
+                            .map(drop),
                     }?;
                 }
             }
@@ -505,10 +600,12 @@ fn add_wasi_and_stubs(
                         let name = name.clone();
                         move |_, _, _| Err(anyhow!("called trapping stub: {name}"))
                     }),
-                    Stub::Resource(name) => instance.resource::<()>(name, {
-                        let name = name.clone();
-                        move |_, _| Err(anyhow!("called trapping stub: {name}"))
-                    }),
+                    Stub::Resource(name) => instance
+                        .resource(name, ResourceType::host::<()>(), {
+                            let name = name.clone();
+                            move |_, _| Err(anyhow!("called trapping stub: {name}"))
+                        })
+                        .map(drop),
                 }?;
             }
         }
@@ -517,14 +614,47 @@ fn add_wasi_and_stubs(
     Ok(())
 }
 
-fn find_native_extensions(path: &Path, libraries: &mut Vec<PathBuf>) -> Result<()> {
+fn search_directory(
+    root: &Path,
+    path: &Path,
+    libraries: &mut Vec<PathBuf>,
+    config: &mut Option<(PathBuf, PathBuf, RawComponentizePyConfig)>,
+) -> Result<()> {
     if path.is_dir() {
         for entry in fs::read_dir(path)? {
-            find_native_extensions(&entry?.path(), libraries)?;
+            search_directory(root, &entry?.path(), libraries, config)?;
         }
     } else if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
         if name.ends_with(NATIVE_EXTENSION_SUFFIX) {
             libraries.push(path.to_owned());
+        } else if name == "componentize-py.toml" {
+            let do_update = if let Some((existing_root, existing_path, _)) = config {
+                let path = path.canonicalize()?;
+                let existing_path = existing_path.join("componentize-py.toml").canonicalize()?;
+                if path != existing_path {
+                    bail!(
+                        "multiple componentize-py.toml files found, \
+                         which is not yet supported: {} and {}",
+                        existing_path.display(),
+                        path.display()
+                    );
+                }
+
+                // When one directory in `PYTHON_PATH` is a subdirectory of the other, we consider the subdirectory
+                // to be the true owner of the file.  This is important later, when we derive a package name by
+                // stripping the root directory from the file path.
+                root.canonicalize()? > existing_root.canonicalize()?
+            } else {
+                true
+            };
+
+            if do_update {
+                *config = Some((
+                    root.to_owned(),
+                    path.parent().unwrap().to_owned(),
+                    toml::from_str::<RawComponentizePyConfig>(&fs::read_to_string(path)?)?,
+                ));
+            }
         }
     }
 

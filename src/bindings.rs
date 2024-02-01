@@ -370,13 +370,14 @@ pub fn make_bindings(resolve: &Resolve, world: WorldId, summary: &Summary) -> Re
             world,
             wit_component::StringEncoding::UTF8,
             None,
-            None,
         )?),
     });
 
     let result = result.finish();
 
     wasmparser::validate(&result)?;
+
+    std::fs::write("/tmp/bindings.so", &result)?;
 
     Ok(result)
 }

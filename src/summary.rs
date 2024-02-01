@@ -1,7 +1,7 @@
 use {
     crate::{
         abi::{self, MAX_FLAT_PARAMS, MAX_FLAT_RESULTS},
-        bindgen::DISPATCHABLE_CORE_PARAM_COUNT,
+        bindgen::{self, DISPATCHABLE_CORE_PARAM_COUNT},
         exports::exports::{
             self, Case, Constructor, Function, FunctionExport, LocalResource, OwnedKind, OwnedType,
             RemoteResource, Resource, Static, Symbols,
@@ -170,9 +170,10 @@ struct FunctionCode {
     params: String,
     args: String,
     return_statement: String,
-    static_method: &'static str,
+    class_method: &'static str,
     return_type: String,
     result_count: usize,
+    error: Option<String>,
 }
 
 pub struct Summary<'a> {
@@ -213,6 +214,8 @@ impl<'a> Summary<'a> {
 
         me.visit_functions(&resolve.worlds[world].imports, Direction::Import)?;
         me.visit_functions(&resolve.worlds[world].exports, Direction::Export)?;
+
+        me.types = me.types_sorted();
 
         Ok(me)
     }
@@ -530,9 +533,9 @@ impl<'a> Summary<'a> {
         Ok(())
     }
 
-    fn summarize_type(&self, id: TypeId) -> exports::Type {
+    fn summarize_type(&self, id: TypeId, world_module: &str) -> exports::Type {
         let ty = &self.resolve.types[id];
-        if let Some(package) = self.package(ty.owner) {
+        if let Some(package) = self.package(ty.owner, world_module) {
             let name = if let Some(name) = &ty.name {
                 name.to_upper_camel_case().escape()
             } else {
@@ -613,14 +616,14 @@ impl<'a> Summary<'a> {
         }
     }
 
-    pub fn collect_symbols(&self) -> Symbols {
+    pub fn collect_symbols(&self, world_module: &str) -> Symbols {
         let mut exports = Vec::new();
         for function in &self.functions {
             if let FunctionKind::Export = function.kind {
                 let scope = if let Some(interface) = &function.interface {
                     interface.name
                 } else {
-                    &self.resolve.worlds[self.world].name
+                    world_module
                 };
 
                 exports.push(match function.wit_kind {
@@ -660,17 +663,11 @@ impl<'a> Summary<'a> {
 
         let mut types = Vec::new();
         for ty in &self.types {
-            types.push(self.summarize_type(*ty));
+            types.push(self.summarize_type(*ty, world_module));
         }
 
         Symbols {
-            types_package: format!(
-                "{}.types",
-                &self.resolve.worlds[self.world]
-                    .name
-                    .to_snake_case()
-                    .escape()
-            ),
+            types_package: format!("{world_module}.types"),
             exports,
             types,
         }
@@ -703,9 +700,12 @@ impl<'a> Summary<'a> {
 
     fn function_code(
         &self,
+        direction: Direction,
+        world_module: &str,
         function: &MyFunction,
         names: &mut TypeNames,
-        with_typings: bool,
+        seen: &HashSet<TypeId>,
+        resource: Option<TypeId>,
     ) -> FunctionCode {
         enum SpecialReturn<'a> {
             Result(&'a Result_),
@@ -727,24 +727,41 @@ impl<'a> Summary<'a> {
         let snake = self.function_name(function);
 
         let (skip_count, self_) = match function.wit_kind {
-            wit_parser::FunctionKind::Freestanding => (0, false),
-            wit_parser::FunctionKind::Constructor(_) => (0, true),
-            wit_parser::FunctionKind::Method(_) => (1, true),
-            wit_parser::FunctionKind::Static(_) => (0, false),
+            wit_parser::FunctionKind::Freestanding => (0, None),
+            wit_parser::FunctionKind::Constructor(_) => (0, Some("self")),
+            wit_parser::FunctionKind::Method(_) => (1, Some("self")),
+            wit_parser::FunctionKind::Static(_) => (0, Some("cls")),
         };
 
-        let mut type_name = |ty| names.type_name(ty);
+        let mut type_name = |ty| names.type_name(ty, seen, resource);
+
+        let absolute_type_name = |ty| {
+            format!(
+                "{world_module}.{}.{}",
+                match direction {
+                    Direction::Import => "imports",
+                    Direction::Export => "exports",
+                },
+                TypeNames::new(self, TypeOwner::None).type_name(
+                    ty,
+                    &if let Type::Id(id) = ty {
+                        Some(bindgen::dealias(self.resolve, id))
+                    } else {
+                        None
+                    }
+                    .into_iter()
+                    .collect::<HashSet<_>>(),
+                    None
+                )
+            )
+        };
 
         let params = self_
-            .then(|| "self".to_string())
+            .map(|s| s.to_string())
             .into_iter()
             .chain(function.params.iter().skip(skip_count).map(|(name, ty)| {
                 let snake = name.to_snake_case().escape();
-                if with_typings {
-                    format!("{snake}: {}", type_name(*ty))
-                } else {
-                    snake
-                }
+                format!("{snake}: {}", type_name(*ty))
             }))
             .collect::<Vec<_>>()
             .join(", ");
@@ -758,9 +775,9 @@ impl<'a> Summary<'a> {
 
         let result_types = function.results.types().collect::<Vec<_>>();
 
-        let (return_statement, return_type) =
+        let (return_statement, return_type, error) =
             if let wit_parser::FunctionKind::Constructor(_) = function.wit_kind {
-                ("return".to_owned(), "None".to_owned())
+                ("return".to_owned(), "None".to_owned(), None)
             } else {
                 let indent = if let wit_parser::FunctionKind::Freestanding = function.wit_kind {
                     ""
@@ -769,18 +786,29 @@ impl<'a> Summary<'a> {
                 };
 
                 match result_types.as_slice() {
-                    [] => ("return".to_owned(), "None".to_owned()),
+                    [] => ("return".to_owned(), "None".to_owned(), None),
                     [ty] => match special_return(*ty) {
-                        SpecialReturn::Result(result) => (
-                            format!(
-                                "if isinstance(result[0], Err):
+                        SpecialReturn::Result(result) => {
+                            let error = if let Some(ty) = result.err {
+                                Some(absolute_type_name(ty))
+                            } else {
+                                Some("None".into())
+                            };
+
+                            (
+                                format!(
+                                    "if isinstance(result[0], Err):
 {indent}        raise result[0]
 {indent}    else:
 {indent}        return result[0].value"
-                            ),
-                            result.ok.map(type_name).unwrap_or_else(|| "None".into()),
-                        ),
-                        SpecialReturn::None => ("return result[0]".to_owned(), type_name(*ty)),
+                                ),
+                                result.ok.map(type_name).unwrap_or_else(|| "None".into()),
+                                error,
+                            )
+                        }
+                        SpecialReturn::None => {
+                            ("return result[0]".to_owned(), type_name(*ty), None)
+                        }
                     },
                     _ => (
                         "return result".to_owned(),
@@ -792,14 +820,15 @@ impl<'a> Summary<'a> {
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         ),
+                        None,
                     ),
                 }
             };
 
         let result_count = result_types.len();
 
-        let static_method = if let wit_parser::FunctionKind::Static(_) = function.wit_kind {
-            "\n    @staticmethod"
+        let class_method = if let wit_parser::FunctionKind::Static(_) = function.wit_kind {
+            "\n    @classmethod"
         } else {
             ""
         };
@@ -809,17 +838,145 @@ impl<'a> Summary<'a> {
             params,
             args,
             return_statement,
-            static_method,
-            return_type: if with_typings {
-                format!(" -> {return_type}")
-            } else {
-                String::new()
-            },
+            class_method,
+            return_type: format!(" -> {return_type}"),
             result_count,
+            error,
         }
     }
 
-    pub fn generate_code(&self, path: &Path, with_typings: bool) -> Result<()> {
+    fn sort(&self, ty: Type, sorted: &mut IndexSet<TypeId>, visited: &mut HashSet<TypeId>) {
+        match ty {
+            Type::Bool
+            | Type::U8
+            | Type::U16
+            | Type::U32
+            | Type::S8
+            | Type::S16
+            | Type::S32
+            | Type::Char
+            | Type::U64
+            | Type::S64
+            | Type::Float32
+            | Type::Float64
+            | Type::String => (),
+            Type::Id(id) => {
+                let ty = &self.resolve.types[id];
+                match &ty.kind {
+                    TypeDefKind::Record(record) => {
+                        for field in &record.fields {
+                            self.sort(field.ty, sorted, visited);
+                        }
+                        sorted.insert(id);
+                    }
+                    TypeDefKind::Variant(variant) => {
+                        for case in &variant.cases {
+                            if let Some(ty) = case.ty {
+                                self.sort(ty, sorted, visited);
+                            }
+                        }
+                        sorted.insert(id);
+                    }
+                    TypeDefKind::Enum(_) | TypeDefKind::Flags(_) => {
+                        sorted.insert(id);
+                    }
+                    TypeDefKind::Handle(Handle::Borrow(resource) | Handle::Own(resource)) => {
+                        self.sort(Type::Id(*resource), sorted, visited);
+                        sorted.insert(id);
+                    }
+                    TypeDefKind::Option(some) => {
+                        self.sort(*some, sorted, visited);
+                        sorted.insert(id);
+                    }
+                    TypeDefKind::Result(result) => {
+                        if let Some(ty) = result.ok {
+                            self.sort(ty, sorted, visited);
+                        }
+                        if let Some(ty) = result.err {
+                            self.sort(ty, sorted, visited);
+                        }
+                        sorted.insert(id);
+                    }
+                    TypeDefKind::Tuple(tuple) => {
+                        for ty in &tuple.types {
+                            self.sort(*ty, sorted, visited);
+                        }
+                        sorted.insert(id);
+                    }
+                    TypeDefKind::List(ty) => {
+                        self.sort(*ty, sorted, visited);
+                    }
+                    TypeDefKind::Type(ty) => {
+                        self.sort(*ty, sorted, visited);
+                    }
+                    TypeDefKind::Resource => {
+                        if !visited.contains(&id) {
+                            visited.insert(id);
+
+                            let sort = |function: &MyFunction, sorted: &mut _, visited: &mut _| {
+                                for (_, ty) in function.params {
+                                    self.sort(*ty, &mut *sorted, &mut *visited);
+                                }
+
+                                for ty in function.results.types() {
+                                    self.sort(ty, &mut *sorted, &mut *visited);
+                                }
+                            };
+
+                            let empty = &ResourceInfo::default();
+
+                            if self
+                                .resource_info
+                                .get(&id)
+                                .unwrap_or(empty)
+                                .remote_dispatch_index
+                                .is_some()
+                            {
+                                for function in &self.functions {
+                                    if matches_resource(function, id, Direction::Import) {
+                                        sort(function, sorted, visited);
+                                    }
+                                }
+                            }
+
+                            if self
+                                .resource_info
+                                .get(&id)
+                                .unwrap_or(empty)
+                                .local_dispatch_index
+                                .is_some()
+                            {
+                                for function in &self.functions {
+                                    if matches_resource(function, id, Direction::Export) {
+                                        sort(function, sorted, visited);
+                                    }
+                                }
+                            }
+
+                            sorted.insert(id);
+                        }
+                    }
+                    kind => todo!("{kind:?}"),
+                }
+            }
+        }
+    }
+
+    fn types_sorted(&self) -> IndexSet<TypeId> {
+        let mut sorted = IndexSet::new();
+        let mut visited = HashSet::new();
+        for id in &self.types {
+            self.sort(Type::Id(*id), &mut sorted, &mut visited);
+        }
+        sorted
+    }
+
+    pub fn generate_code(
+        &self,
+        path: &Path,
+        world_module: &str,
+        stub_runtime_calls: bool,
+    ) -> Result<()> {
         #[derive(Default)]
         struct Definitions<'a> {
             types: Vec<String>,
@@ -838,7 +995,17 @@ impl<'a> Summary<'a> {
             },
         }
 
-        let docstring = |docs: Option<&str>, indent_level| {
+        let docstring = |docs: Option<&str>, indent_level, error: Option<&str>| {
+            let docs = match (
+                docs,
+                error.map(|e| format!("Raises: `{world_module}.types.Err({e})`")),
+            ) {
+                (Some(docs), Some(error_docs)) => Some(format!("{docs}\n\n{error_docs}")),
+                (Some(docs), None) => Some(docs.to_owned()),
+                (None, Some(error_docs)) => Some(error_docs),
+                (None, None) => None,
+            };
+
             if let Some(docs) = docs {
                 let newline = '\n';
                 let indent = (0..indent_level)
@@ -860,8 +1027,9 @@ impl<'a> Summary<'a> {
         let mut interface_exports = HashMap::<&str, Definitions>::new();
         let mut world_imports = Definitions::default();
         let mut world_exports = Definitions::default();
-        for (index, id) in self.types.iter().enumerate() {
-            let ty = &self.resolve.types[*id];
+        let mut seen = HashSet::new();
+        for (index, id) in self.types.iter().copied().enumerate() {
+            let ty = &self.resolve.types[id];
             let mut names = TypeNames::new(self, ty.owner);
 
             let camel = || {
@@ -876,7 +1044,10 @@ impl<'a> Summary<'a> {
                 let mut fields = fields
                     .iter()
                     .map(|(field_name, field_type)| {
-                        format!("{field_name}: {}", names.type_name(*field_type))
+                        format!(
+                            "{field_name}: {}",
+                            names.type_name(*field_type, &seen, None)
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join("\n    ");
@@ -885,7 +1056,7 @@ impl<'a> Summary<'a> {
                     fields = "pass".to_owned()
                 }
 
-                let docs = docstring(docs, 1);
+                let docs = docstring(docs, 1, None);
 
                 format!(
                     "
@@ -934,20 +1105,14 @@ class {name}:
                         .collect::<Vec<_>>()
                         .join(", ");
 
-                    let docs = if let Some(docs) = &ty.docs.contents {
-                        docs.lines()
-                            .map(|line| format!("# {line}\n"))
-                            .collect::<Vec<_>>()
-                            .concat()
-                    } else {
-                        String::new()
-                    };
+                    let docs = docstring(ty.docs.contents.as_deref(), 0, None);
 
                     Code::Shared(format!(
                         "
 {classes}
 
-{docs}{camel} = Union[{cases}]
+{camel} = Union[{cases}]
+{docs}
 "
                     ))
                 }
@@ -963,7 +1128,7 @@ class {name}:
                         .collect::<Vec<_>>()
                         .join("\n    ");
 
-                    let docs = docstring(ty.docs.contents.as_deref(), 1);
+                    let docs = docstring(ty.docs.contents.as_deref(), 1, None);
 
                     Code::Shared(format!(
                         "
@@ -987,7 +1152,7 @@ class {camel}(Enum):
                         flags
                     };
 
-                    let docs = docstring(ty.docs.contents.as_deref(), 1);
+                    let docs = docstring(ty.docs.contents.as_deref(), 1, None);
 
                     Code::Shared(format!(
                         "
@@ -999,13 +1164,13 @@ class {camel}(Flag):
                 TypeDefKind::Resource => {
                     let camel = camel();
 
-                    let docs = docstring(ty.docs.contents.as_deref(), 1);
+                    let docs = docstring(ty.docs.contents.as_deref(), 1, None);
 
                     let empty = &ResourceInfo::default();
 
                     let import = if self
                         .resource_info
-                        .get(id)
+                        .get(&id)
                         .unwrap_or(empty)
                         .remote_dispatch_index
                         .is_some()
@@ -1017,25 +1182,49 @@ class {camel}(Flag):
                                 args,
                                 return_type,
                                 return_statement,
-                                static_method,
+                                class_method,
                                 result_count,
-                            } = self.function_code(function, &mut names, with_typings);
+                                error,
+                            } = self.function_code(
+                                Direction::Import,
+                                world_module,
+                                function,
+                                &mut names,
+                                &seen,
+                                Some(id),
+                            );
 
-                            let docs = docstring(function.docs, 2);
+                            let docs = docstring(function.docs, 2, error.as_deref());
 
                             if let wit_parser::FunctionKind::Constructor(_) = function.wit_kind {
-                                format!(
-                                    "
+                                if stub_runtime_calls {
+                                    format!(
+                                        "
+    def {snake}({params}):
+        {docs}raise NotImplementedError
+"
+                                    )
+                                } else {
+                                    format!(
+                                        "
     def {snake}({params}):
         {docs}tmp = componentize_py_runtime.call_import({index}, [{args}], {result_count})[0]
         (_, func, args, _) = tmp.finalizer.detach()
         self.handle = tmp.handle
         self.finalizer = weakref.finalize(self, func, args[0], args[1])
 "
+                                    )
+                                }
+                            } else if stub_runtime_calls {
+                                format!(
+                                    "{class_method}
+    def {snake}({params}){return_type}:
+        {docs}raise NotImplementedError
+"
                                 )
                             } else {
                                 format!(
-                                    "{static_method}
+                                    "{class_method}
     def {snake}({params}){return_type}:
         {docs}result = componentize_py_runtime.call_import({index}, [{args}], {result_count})
         {return_statement}
@@ -1049,7 +1238,6 @@ class {camel}(Flag):
                             .iter()
                             .filter_map({
                                 let mut index = 0;
-                                let id = *id;
                                 move |function| {
                                     let result = matches_resource(function, id, Direction::Import)
                                         .then_some((index, function));
@@ -1062,16 +1250,35 @@ class {camel}(Flag):
                                 }
                             })
                             .map(method)
-                            // TODO: avoid potential name conflict:
-                            .chain(iter::once(
-                                "
-    def drop(self):
-        (_, func, args, _) = self.finalizer.detach()
+                            .chain(iter::once({
+                                let newline = '\n';
+                                let indent = "        ";
+                                let doc = "Release this resource.";
+                                let docs =
+                                    format!(r#""""{newline}{indent}{doc}{newline}{indent}"""{newline}{indent}"#);
+                                let enter = r#"
+    def __enter__(self):
+        """Returns self"""
+        return self
+                                "#;
+                                if stub_runtime_calls {
+                                    format!(
+                                        "{enter}                                    
+    def __exit__(self, *args):
+        {docs}raise NotImplementedError
+"
+                                    )
+                                } else {
+                                    format!(
+                                        "{enter}
+    def __exit__(self, *args):
+        {docs}(_, func, args, _) = self.finalizer.detach()
         self.handle = None
         func(args[0], args[1])
 "
-                                .to_owned(),
-                            ))
+                                    )
+                                }
+                            }))
                             .collect::<Vec<_>>()
                             .concat();
 
@@ -1087,7 +1294,7 @@ class {camel}:
 
                     let export = if self
                         .resource_info
-                        .get(id)
+                        .get(&id)
                         .unwrap_or(empty)
                         .local_dispatch_index
                         .is_some()
@@ -1097,14 +1304,22 @@ class {camel}:
                                 snake,
                                 params,
                                 return_type,
-                                static_method,
+                                class_method,
+                                error,
                                 ..
-                            } = self.function_code(function, &mut names, with_typings);
+                            } = self.function_code(
+                                Direction::Export,
+                                world_module,
+                                function,
+                                &mut names,
+                                &seen,
+                                Some(id),
+                            );
 
-                            let docs = docstring(function.docs, 2);
+                            let docs = docstring(function.docs, 2, error.as_deref());
 
                             format!(
-                                "{static_method}
+                                "{class_method}
     @abstractmethod
     def {snake}({params}){return_type}:
         {docs}raise NotImplementedError
@@ -1115,7 +1330,7 @@ class {camel}:
                         let methods = self
                             .functions
                             .iter()
-                            .filter(|function| matches_resource(function, *id, Direction::Export))
+                            .filter(|function| matches_resource(function, id, Direction::Export))
                             .map(method)
                             .collect::<Vec<_>>()
                             .concat();
@@ -1141,7 +1356,7 @@ class {camel}(Protocol):
             };
 
             let code = match code {
-                Code::Shared(code) if self.has_imported_and_exported_resource(Type::Id(*id)) => {
+                Code::Shared(code) if self.has_imported_and_exported_resource(Type::Id(id)) => {
                     Code::Separate {
                         import: Some(code.clone()),
                         export: Some(code),
@@ -1215,6 +1430,8 @@ class {camel}(Protocol):
                     }
                 }
             }
+
+            seen.insert(id);
         }
 
         let mut index = 0;
@@ -1243,20 +1460,37 @@ class {camel}(Protocol):
                         return_type,
                         return_statement,
                         result_count,
+                        error,
                         ..
-                    } = self.function_code(function, &mut names, with_typings);
+                    } = self.function_code(
+                        Direction::Import,
+                        world_module,
+                        function,
+                        &mut names,
+                        &seen,
+                        None,
+                    );
 
                     match function.kind {
                         FunctionKind::Import => {
-                            let docs = docstring(function.docs, 1);
+                            let docs = docstring(function.docs, 1, error.as_deref());
 
-                            let code = format!(
-                                "
+                            let code = if stub_runtime_calls {
+                                format!(
+                                    "
+def {snake}({params}){return_type}:
+    {docs}raise NotImplementedError
+"
+                                )
+                            } else {
+                                format!(
+                                    "
 def {snake}({params}){return_type}:
     {docs}result = componentize_py_runtime.call_import({index}, [{args}], {result_count})
     {return_statement}
 "
-                            );
+                                )
+                            };
 
                             let (definitions, docs) = if let Some(interface) = &function.interface {
                                 (
@@ -1281,7 +1515,7 @@ def {snake}({params}){return_type}:
                                 format!("self, {params}")
                             };
 
-                            let docs = docstring(function.docs, 2);
+                            let docs = docstring(function.docs, 2, error.as_deref());
 
                             let code = format!(
                                 "
@@ -1319,7 +1553,7 @@ def {snake}({params}){return_type}:
         }
 
         let python_imports =
-            "from typing import TypeVar, Generic, Union, Optional, Union, Protocol, Tuple, List, Any
+            "from typing import TypeVar, Generic, Union, Optional, Union, Protocol, Tuple, List, Any, Self
 from enum import Flag, Enum, auto
 from dataclasses import dataclass
 from abc import abstractmethod
@@ -1372,13 +1606,18 @@ Result = Union[Ok[T], Err[E]]
                     .map(|&interface| import("..", interface))
                     .collect::<Vec<_>>()
                     .join("\n");
-                let docs = docstring(code.docs, 0);
+                let docs = docstring(code.docs, 0, None);
+
+                let imports = if stub_runtime_calls {
+                    imports
+                } else {
+                    format!("import componentize_py_runtime\n{imports}")
+                };
 
                 write!(
                     file,
                     "{docs}{python_imports}
 from ..types import Result, Ok, Err, Some
-import componentize_py_runtime
 {imports}
 {types}
 {functions}
@@ -1403,7 +1642,7 @@ import componentize_py_runtime
                     .map(|interface| import("..", interface))
                     .collect::<Vec<_>>()
                     .join("\n");
-                let docs = docstring(code.docs, 0);
+                let docs = docstring(code.docs, 0, None);
 
                 write!(
                     file,
@@ -1473,13 +1712,18 @@ from ..types import Result, Ok, Err, Some
                 .map(|&interface| import(".", interface))
                 .collect::<Vec<_>>()
                 .join("\n");
-            let docs = docstring(world_exports.docs, 0);
+            let docs = docstring(world_exports.docs, 0, None);
+
+            let imports = if stub_runtime_calls {
+                imports
+            } else {
+                format!("import componentize_py_runtime\n{imports}")
+            };
 
             write!(
                 file,
                 "{docs}{python_imports}
 from .types import Result, Ok, Err, Some
-import componentize_py_runtime
 {imports}
 {function_imports}
 {type_exports}
@@ -1506,21 +1750,13 @@ class {camel}(Protocol):
         }
     }
 
-    fn package(&self, owner: TypeOwner) -> Option<String> {
+    fn package(&self, owner: TypeOwner, world_module: &str) -> Option<String> {
         match owner {
             TypeOwner::Interface(interface) => {
                 let (module, package) = self.interface_package(interface);
-                Some(format!(
-                    "{}.{module}.{package}",
-                    self.resolve.worlds[self.world]
-                        .name
-                        .to_snake_case()
-                        .escape(),
-                ))
+                Some(format!("{world_module}.{module}.{package}",))
             }
-            TypeOwner::World(world) => {
-                Some(self.resolve.worlds[world].name.to_snake_case().escape())
-            }
+            TypeOwner::World(_) => Some(world_module.to_owned()),
             TypeOwner::None => None,
         }
     }
@@ -1597,7 +1833,7 @@ impl<'a> TypeNames<'a> {
         }
     }
 
-    fn type_name(&mut self, ty: Type) -> String {
+    fn type_name(&mut self, ty: Type, seen: &HashSet<TypeId>, resource: Option<TypeId>) -> String {
         match ty {
             Type::Bool
             | Type::U8
@@ -1618,60 +1854,66 @@ impl<'a> TypeNames<'a> {
                     | TypeDefKind::Enum(_)
                     | TypeDefKind::Flags(_)
                     | TypeDefKind::Resource => {
-                        let package = if ty.owner == self.owner {
-                            String::new()
-                        } else {
-                            match ty.owner {
-                                TypeOwner::Interface(interface) => {
-                                    self.imports.insert(interface);
-                                    format!("{}.", self.summary.interface_package(interface).1)
+                        if seen.contains(&id) {
+                            let package = if ty.owner == self.owner {
+                                String::new()
+                            } else {
+                                match ty.owner {
+                                    TypeOwner::Interface(interface) => {
+                                        self.imports.insert(interface);
+                                        format!("{}.", self.summary.interface_package(interface).1)
+                                    }
+                                    // todo: place anonymous types in types.py and import them from there
+                                    _ => String::new(),
                                 }
-                                // todo: place anonymous types in types.py and import them from there
-                                _ => String::new(),
-                            }
-                        };
+                            };
 
-                        let name = if let Some(name) = &ty.name {
-                            name.to_upper_camel_case().escape()
+                            let name = if let Some(name) = &ty.name {
+                                name.to_upper_camel_case().escape()
+                            } else {
+                                format!(
+                                    "AnonymousType{}",
+                                    self.summary.types.get_index_of(&id).unwrap()
+                                )
+                            };
+
+                            format!("{package}{name}")
                         } else {
-                            format!(
-                                "AnonymousType{}",
-                                self.summary.types.get_index_of(&id).unwrap()
-                            )
-                        };
-
-                        format!("{package}{name}",)
+                            // As of this writing, there's no concept of forward declaration in Python, so we must
+                            // either use `Any` or `Self` for types which have not yet been fully declared.
+                            if Some(id) == resource { "Self" } else { "Any" }.to_owned()
+                        }
                     }
                     TypeDefKind::Option(some) => {
                         if abi::is_option(self.summary.resolve, *some) {
-                            format!("Optional[Some[{}]]", self.type_name(*some))
+                            format!("Optional[Some[{}]]", self.type_name(*some, seen, resource))
                         } else {
-                            format!("Optional[{}]", self.type_name(*some))
+                            format!("Optional[{}]", self.type_name(*some, seen, resource))
                         }
                     }
                     TypeDefKind::Result(result) => format!(
                         "Result[{}, {}]",
                         result
                             .ok
-                            .map(|ty| self.type_name(ty))
+                            .map(|ty| self.type_name(ty, seen, resource))
                             .unwrap_or_else(|| "None".into()),
                         result
                             .err
-                            .map(|ty| self.type_name(ty))
+                            .map(|ty| self.type_name(ty, seen, resource))
                             .unwrap_or_else(|| "None".into())
                     ),
                     TypeDefKind::List(ty) => {
                         if let Type::U8 | Type::S8 = ty {
                             "bytes".into()
                         } else {
-                            format!("List[{}]", self.type_name(*ty))
+                            format!("List[{}]", self.type_name(*ty, seen, resource))
                         }
                     }
                     TypeDefKind::Tuple(tuple) => {
                         let types = tuple
                             .types
                             .iter()
-                            .map(|ty| self.type_name(*ty))
+                            .map(|ty| self.type_name(*ty, seen, resource))
                             .collect::<Vec<_>>()
                             .join(", ");
                         let types = if types.is_empty() {
@@ -1682,9 +1924,9 @@ impl<'a> TypeNames<'a> {
                         format!("Tuple[{types}]")
                     }
                     TypeDefKind::Handle(Handle::Own(ty) | Handle::Borrow(ty)) => {
-                        self.type_name(Type::Id(*ty))
+                        self.type_name(Type::Id(*ty), seen, resource)
                     }
-                    TypeDefKind::Type(ty) => self.type_name(*ty),
+                    TypeDefKind::Type(ty) => self.type_name(*ty, seen, resource),
                     kind => todo!("{kind:?}"),
                 }
             }
